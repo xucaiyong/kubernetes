@@ -19,6 +19,7 @@ package credentialprovider
 import (
 	"encoding/base64"
 	"fmt"
+	"reflect"
 	"testing"
 )
 
@@ -462,22 +463,17 @@ func (d *testProvider) Enabled() bool {
 	return true
 }
 
-// LazyProvide implements dockerConfigProvider. Should never be called.
-func (d *testProvider) LazyProvide() *DockerConfigEntry {
-	return nil
-}
-
 // Provide implements dockerConfigProvider
-func (d *testProvider) Provide() DockerConfig {
-	d.Count += 1
+func (d *testProvider) Provide(image string) DockerConfig {
+	d.Count++
 	return DockerConfig{}
 }
 
-func TestLazyKeyring(t *testing.T) {
+func TestProvidersDockerKeyring(t *testing.T) {
 	provider := &testProvider{
 		Count: 0,
 	}
-	lazy := &lazyDockerKeyring{
+	keyring := &providersDockerKeyring{
 		Providers: []DockerConfigProvider{
 			provider,
 		},
@@ -486,16 +482,124 @@ func TestLazyKeyring(t *testing.T) {
 	if provider.Count != 0 {
 		t.Errorf("Unexpected number of Provide calls: %v", provider.Count)
 	}
-	lazy.Lookup("foo")
+	keyring.Lookup("foo")
 	if provider.Count != 1 {
 		t.Errorf("Unexpected number of Provide calls: %v", provider.Count)
 	}
-	lazy.Lookup("foo")
+	keyring.Lookup("foo")
 	if provider.Count != 2 {
 		t.Errorf("Unexpected number of Provide calls: %v", provider.Count)
 	}
-	lazy.Lookup("foo")
+	keyring.Lookup("foo")
 	if provider.Count != 3 {
 		t.Errorf("Unexpected number of Provide calls: %v", provider.Count)
+	}
+}
+
+func TestDockerKeyringLookup(t *testing.T) {
+	ada := AuthConfig{
+		Username: "ada",
+		Password: "smash",
+		Email:    "ada@example.com",
+	}
+
+	grace := AuthConfig{
+		Username: "grace",
+		Password: "squash",
+		Email:    "grace@example.com",
+	}
+
+	dk := &BasicDockerKeyring{}
+	dk.Add(DockerConfig{
+		"bar.example.com/pong": DockerConfigEntry{
+			Username: grace.Username,
+			Password: grace.Password,
+			Email:    grace.Email,
+		},
+		"bar.example.com": DockerConfigEntry{
+			Username: ada.Username,
+			Password: ada.Password,
+			Email:    ada.Email,
+		},
+	})
+
+	tests := []struct {
+		image string
+		match []AuthConfig
+		ok    bool
+	}{
+		// direct match
+		{"bar.example.com", []AuthConfig{ada}, true},
+
+		// direct match deeper than other possible matches
+		{"bar.example.com/pong", []AuthConfig{grace, ada}, true},
+
+		// no direct match, deeper path ignored
+		{"bar.example.com/ping", []AuthConfig{ada}, true},
+
+		// match first part of path token
+		{"bar.example.com/pongz", []AuthConfig{grace, ada}, true},
+
+		// match regardless of sub-path
+		{"bar.example.com/pong/pang", []AuthConfig{grace, ada}, true},
+
+		// no host match
+		{"example.com", []AuthConfig{}, false},
+		{"foo.example.com", []AuthConfig{}, false},
+	}
+
+	for i, tt := range tests {
+		match, ok := dk.Lookup(tt.image)
+		if tt.ok != ok {
+			t.Errorf("case %d: expected ok=%t, got %t", i, tt.ok, ok)
+		}
+
+		if !reflect.DeepEqual(tt.match, match) {
+			t.Errorf("case %d: expected match=%#v, got %#v", i, tt.match, match)
+		}
+	}
+}
+
+// This validates that dockercfg entries with a scheme and url path are properly matched
+// by images that only match the hostname.
+// NOTE: the above covers the case of a more specific match trumping just hostname.
+func TestIssue3797(t *testing.T) {
+	rex := AuthConfig{
+		Username: "rex",
+		Password: "tiny arms",
+		Email:    "rex@example.com",
+	}
+
+	dk := &BasicDockerKeyring{}
+	dk.Add(DockerConfig{
+		"https://quay.io/v1/": DockerConfigEntry{
+			Username: rex.Username,
+			Password: rex.Password,
+			Email:    rex.Email,
+		},
+	})
+
+	tests := []struct {
+		image string
+		match []AuthConfig
+		ok    bool
+	}{
+		// direct match
+		{"quay.io", []AuthConfig{rex}, true},
+
+		// partial matches
+		{"quay.io/foo", []AuthConfig{rex}, true},
+		{"quay.io/foo/bar", []AuthConfig{rex}, true},
+	}
+
+	for i, tt := range tests {
+		match, ok := dk.Lookup(tt.image)
+		if tt.ok != ok {
+			t.Errorf("case %d: expected ok=%t, got %t", i, tt.ok, ok)
+		}
+
+		if !reflect.DeepEqual(tt.match, match) {
+			t.Errorf("case %d: expected match=%#v, got %#v", i, tt.match, match)
+		}
 	}
 }

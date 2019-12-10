@@ -21,89 +21,129 @@ import (
 	"sync"
 	"time"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/client/cache"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
-	"k8s.io/kubernetes/pkg/controller"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util/metrics"
-	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
-	"k8s.io/kubernetes/pkg/util/wait"
-	"k8s.io/kubernetes/pkg/watch"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
+	coreinformers "k8s.io/client-go/informers/core/v1"
+	clientset "k8s.io/client-go/kubernetes"
+	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
+	"k8s.io/component-base/metrics/prometheus/ratelimiter"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 )
 
 const (
+	// gcCheckPeriod defines frequency of running main controller loop
 	gcCheckPeriod = 20 * time.Second
+	// quarantineTime defines how long Orphaned GC waits for nodes to show up
+	// in an informer before issuing a GET call to check if they are truly gone
+	quarantineTime = 40 * time.Second
 )
 
 type PodGCController struct {
-	kubeClient     clientset.Interface
-	podStore       cache.StoreToPodLister
-	podStoreSyncer *cache.Controller
-	deletePod      func(namespace, name string) error
-	threshold      int
+	kubeClient clientset.Interface
+
+	podLister        corelisters.PodLister
+	podListerSynced  cache.InformerSynced
+	nodeLister       corelisters.NodeLister
+	nodeListerSynced cache.InformerSynced
+
+	nodeQueue workqueue.DelayingInterface
+
+	deletePod              func(namespace, name string) error
+	terminatedPodThreshold int
 }
 
-func New(kubeClient clientset.Interface, resyncPeriod controller.ResyncPeriodFunc, threshold int) *PodGCController {
-	if kubeClient != nil && kubeClient.Core().GetRESTClient().GetRateLimiter() != nil {
-		metrics.RegisterMetricAndTrackRateLimiterUsage("gc_controller", kubeClient.Core().GetRESTClient().GetRateLimiter())
+func NewPodGC(kubeClient clientset.Interface, podInformer coreinformers.PodInformer,
+	nodeInformer coreinformers.NodeInformer, terminatedPodThreshold int) *PodGCController {
+	if kubeClient != nil && kubeClient.CoreV1().RESTClient().GetRateLimiter() != nil {
+		ratelimiter.RegisterMetricAndTrackRateLimiterUsage("gc_controller", kubeClient.CoreV1().RESTClient().GetRateLimiter())
 	}
 	gcc := &PodGCController{
-		kubeClient: kubeClient,
-		threshold:  threshold,
+		kubeClient:             kubeClient,
+		terminatedPodThreshold: terminatedPodThreshold,
+		podLister:              podInformer.Lister(),
+		podListerSynced:        podInformer.Informer().HasSynced,
+		nodeLister:             nodeInformer.Lister(),
+		nodeListerSynced:       nodeInformer.Informer().HasSynced,
+		nodeQueue:              workqueue.NewNamedDelayingQueue("orphaned_pods_nodes"),
 		deletePod: func(namespace, name string) error {
-			return kubeClient.Core().Pods(namespace).Delete(name, api.NewDeleteOptions(0))
+			klog.Infof("PodGC is force deleting Pod: %v/%v", namespace, name)
+			return kubeClient.CoreV1().Pods(namespace).Delete(name, metav1.NewDeleteOptions(0))
 		},
 	}
 
-	terminatedSelector := fields.ParseSelectorOrDie("status.phase!=" + string(api.PodPending) + ",status.phase!=" + string(api.PodRunning) + ",status.phase!=" + string(api.PodUnknown))
-
-	gcc.podStore.Indexer, gcc.podStoreSyncer = cache.NewIndexerInformer(
-		&cache.ListWatch{
-			ListFunc: func(options api.ListOptions) (runtime.Object, error) {
-				options.FieldSelector = terminatedSelector
-				return gcc.kubeClient.Core().Pods(api.NamespaceAll).List(options)
-			},
-			WatchFunc: func(options api.ListOptions) (watch.Interface, error) {
-				options.FieldSelector = terminatedSelector
-				return gcc.kubeClient.Core().Pods(api.NamespaceAll).Watch(options)
-			},
-		},
-		&api.Pod{},
-		resyncPeriod(),
-		cache.ResourceEventHandlerFuncs{},
-		// We don't need to build a index for podStore here actually, but build one for consistency.
-		// It will ensure that if people start making use of the podStore in more specific ways,
-		// they'll get the benefits they expect. It will also reserve the name for future refactorings.
-		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
-	)
 	return gcc
 }
 
 func (gcc *PodGCController) Run(stop <-chan struct{}) {
-	go gcc.podStoreSyncer.Run(stop)
+	defer utilruntime.HandleCrash()
+
+	klog.Infof("Starting GC controller")
+	defer gcc.nodeQueue.ShutDown()
+	defer klog.Infof("Shutting down GC controller")
+
+	if !cache.WaitForNamedCacheSync("GC", stop, gcc.podListerSynced, gcc.nodeListerSynced) {
+		return
+	}
+
 	go wait.Until(gcc.gc, gcCheckPeriod, stop)
+
 	<-stop
 }
 
 func (gcc *PodGCController) gc() {
-	terminatedPods, _ := gcc.podStore.List(labels.Everything())
-	terminatedPodCount := len(terminatedPods)
-	sort.Sort(byCreationTimestamp(terminatedPods))
+	pods, err := gcc.podLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("Error while listing all pods: %v", err)
+		return
+	}
+	nodes, err := gcc.nodeLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("Error while listing all nodes: %v", err)
+		return
+	}
+	if gcc.terminatedPodThreshold > 0 {
+		gcc.gcTerminated(pods)
+	}
+	gcc.gcOrphaned(pods, nodes)
+	gcc.gcUnscheduledTerminating(pods)
+}
 
-	deleteCount := terminatedPodCount - gcc.threshold
+func isPodTerminated(pod *v1.Pod) bool {
+	if phase := pod.Status.Phase; phase != v1.PodPending && phase != v1.PodRunning && phase != v1.PodUnknown {
+		return true
+	}
+	return false
+}
+
+func (gcc *PodGCController) gcTerminated(pods []*v1.Pod) {
+	terminatedPods := []*v1.Pod{}
+	for _, pod := range pods {
+		if isPodTerminated(pod) {
+			terminatedPods = append(terminatedPods, pod)
+		}
+	}
+
+	terminatedPodCount := len(terminatedPods)
+	deleteCount := terminatedPodCount - gcc.terminatedPodThreshold
 
 	if deleteCount > terminatedPodCount {
 		deleteCount = terminatedPodCount
 	}
-	if deleteCount > 0 {
-		glog.Infof("garbage collecting %v pods", deleteCount)
+	if deleteCount <= 0 {
+		return
 	}
 
+	klog.Infof("garbage collecting %v pods", deleteCount)
+	// sort only when necessary
+	sort.Sort(byCreationTimestamp(terminatedPods))
 	var wait sync.WaitGroup
 	for i := 0; i < deleteCount; i++ {
 		wait.Add(1)
@@ -118,15 +158,96 @@ func (gcc *PodGCController) gc() {
 	wait.Wait()
 }
 
+// gcOrphaned deletes pods that are bound to nodes that don't exist.
+func (gcc *PodGCController) gcOrphaned(pods []*v1.Pod, nodes []*v1.Node) {
+	klog.V(4).Infof("GC'ing orphaned")
+	existingNodeNames := sets.NewString()
+	for _, node := range nodes {
+		existingNodeNames.Insert(node.Name)
+	}
+	// Add newly found unknown nodes to quarantine
+	for _, pod := range pods {
+		if pod.Spec.NodeName != "" && !existingNodeNames.Has(pod.Spec.NodeName) {
+			gcc.nodeQueue.AddAfter(pod.Spec.NodeName, quarantineTime)
+		}
+	}
+	// Check if nodes are still missing after quarantine period
+	deletedNodesNames, quit := gcc.discoverDeletedNodes(existingNodeNames)
+	if quit {
+		return
+	}
+	// Delete orphaned pods
+	for _, pod := range pods {
+		if !deletedNodesNames.Has(pod.Spec.NodeName) {
+			continue
+		}
+		klog.V(2).Infof("Found orphaned Pod %v/%v assigned to the Node %v. Deleting.", pod.Namespace, pod.Name, pod.Spec.NodeName)
+		if err := gcc.deletePod(pod.Namespace, pod.Name); err != nil {
+			utilruntime.HandleError(err)
+		} else {
+			klog.V(0).Infof("Forced deletion of orphaned Pod %v/%v succeeded", pod.Namespace, pod.Name)
+		}
+	}
+}
+
+func (gcc *PodGCController) discoverDeletedNodes(existingNodeNames sets.String) (sets.String, bool) {
+	deletedNodesNames := sets.NewString()
+	for gcc.nodeQueue.Len() > 0 {
+		item, quit := gcc.nodeQueue.Get()
+		if quit {
+			return nil, true
+		}
+		nodeName := item.(string)
+		if !existingNodeNames.Has(nodeName) {
+			exists, err := gcc.checkIfNodeExists(nodeName)
+			switch {
+			case err != nil:
+				klog.Errorf("Error while getting node %q: %v", nodeName, err)
+				// Node will be added back to the queue in the subsequent loop if still needed
+			case !exists:
+				deletedNodesNames.Insert(nodeName)
+			}
+		}
+		gcc.nodeQueue.Done(item)
+	}
+	return deletedNodesNames, false
+}
+
+func (gcc *PodGCController) checkIfNodeExists(name string) (bool, error) {
+	_, fetchErr := gcc.kubeClient.CoreV1().Nodes().Get(name, metav1.GetOptions{})
+	if errors.IsNotFound(fetchErr) {
+		return false, nil
+	}
+	return fetchErr == nil, fetchErr
+}
+
+// gcUnscheduledTerminating deletes pods that are terminating and haven't been scheduled to a particular node.
+func (gcc *PodGCController) gcUnscheduledTerminating(pods []*v1.Pod) {
+	klog.V(4).Infof("GC'ing unscheduled pods which are terminating.")
+
+	for _, pod := range pods {
+		if pod.DeletionTimestamp == nil || len(pod.Spec.NodeName) > 0 {
+			continue
+		}
+
+		klog.V(2).Infof("Found unscheduled terminating Pod %v/%v not assigned to any Node. Deleting.", pod.Namespace, pod.Name)
+		if err := gcc.deletePod(pod.Namespace, pod.Name); err != nil {
+			utilruntime.HandleError(err)
+		} else {
+			klog.V(0).Infof("Forced deletion of unscheduled terminating Pod %v/%v succeeded", pod.Namespace, pod.Name)
+		}
+	}
+}
+
 // byCreationTimestamp sorts a list by creation timestamp, using their names as a tie breaker.
-type byCreationTimestamp []*api.Pod
+type byCreationTimestamp []*v1.Pod
 
 func (o byCreationTimestamp) Len() int      { return len(o) }
 func (o byCreationTimestamp) Swap(i, j int) { o[i], o[j] = o[j], o[i] }
 
 func (o byCreationTimestamp) Less(i, j int) bool {
-	if o[i].CreationTimestamp.Equal(o[j].CreationTimestamp) {
+	if o[i].CreationTimestamp.Equal(&o[j].CreationTimestamp) {
 		return o[i].Name < o[j].Name
 	}
-	return o[i].CreationTimestamp.Before(o[j].CreationTimestamp)
+	return o[i].CreationTimestamp.Before(&o[j].CreationTimestamp)
 }

@@ -17,37 +17,46 @@ limitations under the License.
 package event
 
 import (
+	"context"
 	"fmt"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/validation"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
-	"k8s.io/kubernetes/pkg/registry/generic"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util/validation/field"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/registry/generic"
+	"k8s.io/apiserver/pkg/registry/rest"
+	"k8s.io/apiserver/pkg/storage"
+	"k8s.io/apiserver/pkg/storage/names"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/apis/core/validation"
 )
 
 type eventStrategy struct {
 	runtime.ObjectTyper
-	api.NameGenerator
+	names.NameGenerator
 }
 
-// Strategy is the default logic that pplies when creating and updating
+// Strategy is the default logic that applies when creating and updating
 // Event objects via the REST API.
-var Strategy = eventStrategy{api.Scheme, api.SimpleNameGenerator}
+var Strategy = eventStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+
+func (eventStrategy) DefaultGarbageCollectionPolicy(ctx context.Context) rest.GarbageCollectionPolicy {
+	return rest.Unsupported
+}
 
 func (eventStrategy) NamespaceScoped() bool {
 	return true
 }
 
-func (eventStrategy) PrepareForCreate(ctx api.Context, obj runtime.Object) {
+func (eventStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 }
 
-func (eventStrategy) PrepareForUpdate(ctx api.Context, obj, old runtime.Object) {
+func (eventStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 }
 
-func (eventStrategy) Validate(ctx api.Context, obj runtime.Object) field.ErrorList {
+func (eventStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	event := obj.(*api.Event)
 	return validation.ValidateEvent(event)
 }
@@ -60,7 +69,7 @@ func (eventStrategy) AllowCreateOnUpdate() bool {
 	return true
 }
 
-func (eventStrategy) ValidateUpdate(ctx api.Context, obj, old runtime.Object) field.ErrorList {
+func (eventStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	event := obj.(*api.Event)
 	return validation.ValidateEvent(event)
 }
@@ -69,22 +78,26 @@ func (eventStrategy) AllowUnconditionalUpdate() bool {
 	return true
 }
 
-func MatchEvent(label labels.Selector, field fields.Selector) *generic.SelectionPredicate {
-	return &generic.SelectionPredicate{
-		Label: label,
-		Field: field,
-		GetAttrs: func(obj runtime.Object) (labels.Set, fields.Set, error) {
-			event, ok := obj.(*api.Event)
-			if !ok {
-				return nil, nil, fmt.Errorf("not an event")
-			}
-			return labels.Set(event.Labels), EventToSelectableFields(event), nil
-		},
+// GetAttrs returns labels and fields of a given object for filtering purposes.
+func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, error) {
+	event, ok := obj.(*api.Event)
+	if !ok {
+		return nil, nil, fmt.Errorf("not an event")
+	}
+	return labels.Set(event.Labels), ToSelectableFields(event), nil
+}
+
+// Matcher returns a selection predicate for a given label and field selector.
+func Matcher(label labels.Selector, field fields.Selector) storage.SelectionPredicate {
+	return storage.SelectionPredicate{
+		Label:    label,
+		Field:    field,
+		GetAttrs: GetAttrs,
 	}
 }
 
-// EventToSelectableFields returns a field set that represents the object
-func EventToSelectableFields(event *api.Event) fields.Set {
+// ToSelectableFields returns a field set that represents the object.
+func ToSelectableFields(event *api.Event) fields.Set {
 	objectMetaFieldsSet := generic.ObjectMetaFieldsSet(&event.ObjectMeta, true)
 	specificFieldsSet := fields.Set{
 		"involvedObject.kind":            event.InvolvedObject.Kind,

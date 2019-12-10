@@ -17,16 +17,26 @@ limitations under the License.
 package pod
 
 import (
+	"context"
+	"net/http"
+	"net/url"
 	"reflect"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/errors"
-	"k8s.io/kubernetes/pkg/api/testapi"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	apitesting "k8s.io/kubernetes/pkg/api/testing"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
-	"k8s.io/kubernetes/pkg/runtime"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/kubelet/client"
+
+	// install all api groups for testing
+	_ "k8s.io/kubernetes/pkg/api/testapi"
 )
 
 func TestMatchPod(t *testing.T) {
@@ -65,6 +75,34 @@ func TestMatchPod(t *testing.T) {
 		},
 		{
 			in: &api.Pod{
+				Spec: api.PodSpec{SchedulerName: "scheduler1"},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("spec.schedulerName=scheduler1"),
+			expectMatch:   true,
+		},
+		{
+			in: &api.Pod{
+				Spec: api.PodSpec{SchedulerName: "scheduler1"},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("spec.schedulerName=scheduler2"),
+			expectMatch:   false,
+		},
+		{
+			in: &api.Pod{
+				Spec: api.PodSpec{ServiceAccountName: "serviceAccount1"},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("spec.serviceAccountName=serviceAccount1"),
+			expectMatch:   true,
+		},
+		{
+			in: &api.Pod{
+				Spec: api.PodSpec{SchedulerName: "serviceAccount1"},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("spec.serviceAccountName=serviceAccount2"),
+			expectMatch:   false,
+		},
+		{
+			in: &api.Pod{
 				Status: api.PodStatus{Phase: api.PodRunning},
 			},
 			fieldSelector: fields.ParseSelectorOrDie("status.phase=Running"),
@@ -77,14 +115,142 @@ func TestMatchPod(t *testing.T) {
 			fieldSelector: fields.ParseSelectorOrDie("status.phase=Pending"),
 			expectMatch:   false,
 		},
+		{
+			in: &api.Pod{
+				Status: api.PodStatus{
+					PodIPs: []api.PodIP{
+						{IP: "1.2.3.4"},
+					},
+				},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("status.podIP=1.2.3.4"),
+			expectMatch:   true,
+		},
+		{
+			in: &api.Pod{
+				Status: api.PodStatus{
+					PodIPs: []api.PodIP{
+						{IP: "1.2.3.4"},
+					},
+				},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("status.podIP=4.3.2.1"),
+			expectMatch:   false,
+		},
+		{
+			in: &api.Pod{
+				Status: api.PodStatus{NominatedNodeName: "node1"},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("status.nominatedNodeName=node1"),
+			expectMatch:   true,
+		},
+		{
+			in: &api.Pod{
+				Status: api.PodStatus{NominatedNodeName: "node1"},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("status.nominatedNodeName=node2"),
+			expectMatch:   false,
+		},
+		{
+			in: &api.Pod{
+				Status: api.PodStatus{
+					PodIPs: []api.PodIP{
+						{IP: "2001:db8::"},
+					},
+				},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("status.podIP=2001:db8::"),
+			expectMatch:   true,
+		},
+		{
+			in: &api.Pod{
+				Status: api.PodStatus{
+					PodIPs: []api.PodIP{
+						{IP: "2001:db8::"},
+					},
+				},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("status.podIP=2001:db7::"),
+			expectMatch:   false,
+		},
 	}
 	for _, testCase := range testCases {
-		result, err := MatchPod(labels.Everything(), testCase.fieldSelector).Matches(testCase.in)
+		m := MatchPod(labels.Everything(), testCase.fieldSelector)
+		result, err := m.Matches(testCase.in)
 		if err != nil {
 			t.Errorf("Unexpected error %v", err)
 		}
 		if result != testCase.expectMatch {
 			t.Errorf("Result %v, Expected %v, Selector: %v, Pod: %v", result, testCase.expectMatch, testCase.fieldSelector.String(), testCase.in)
+		}
+	}
+}
+
+func getResourceList(cpu, memory string) api.ResourceList {
+	res := api.ResourceList{}
+	if cpu != "" {
+		res[api.ResourceCPU] = resource.MustParse(cpu)
+	}
+	if memory != "" {
+		res[api.ResourceMemory] = resource.MustParse(memory)
+	}
+	return res
+}
+
+func getResourceRequirements(requests, limits api.ResourceList) api.ResourceRequirements {
+	res := api.ResourceRequirements{}
+	res.Requests = requests
+	res.Limits = limits
+	return res
+}
+
+func newContainer(name string, requests api.ResourceList, limits api.ResourceList) api.Container {
+	return api.Container{
+		Name:      name,
+		Resources: getResourceRequirements(requests, limits),
+	}
+}
+
+func newPod(name string, containers []api.Container) *api.Pod {
+	return &api.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+		Spec: api.PodSpec{
+			Containers: containers,
+		},
+	}
+}
+
+func TestGetPodQOS(t *testing.T) {
+	testCases := []struct {
+		pod      *api.Pod
+		expected api.PodQOSClass
+	}{
+		{
+			pod: newPod("guaranteed", []api.Container{
+				newContainer("guaranteed", getResourceList("100m", "100Mi"), getResourceList("100m", "100Mi")),
+			}),
+			expected: api.PodQOSGuaranteed,
+		},
+		{
+			pod: newPod("best-effort", []api.Container{
+				newContainer("best-effort", getResourceList("", ""), getResourceList("", "")),
+			}),
+			expected: api.PodQOSBestEffort,
+		},
+		{
+			pod: newPod("burstable", []api.Container{
+				newContainer("burstable", getResourceList("100m", "100Mi"), getResourceList("", "")),
+			}),
+			expected: api.PodQOSBurstable,
+		},
+	}
+	for id, testCase := range testCases {
+		Strategy.PrepareForCreate(genericapirequest.NewContext(), testCase.pod)
+		actual := testCase.pod.Status.QOSClass
+		if actual != testCase.expected {
+			t.Errorf("[%d]: invalid qos pod %s, expected: %s, actual: %s", id, testCase.pod.Name, testCase.expected, actual)
 		}
 	}
 }
@@ -133,8 +299,8 @@ func TestCheckGracefulDelete(t *testing.T) {
 		},
 	}
 	for _, tc := range tcs {
-		out := &api.DeleteOptions{GracePeriodSeconds: &defaultGracePeriod}
-		Strategy.CheckGracefulDelete(api.NewContext(), tc.in, out)
+		out := &metav1.DeleteOptions{GracePeriodSeconds: &defaultGracePeriod}
+		Strategy.CheckGracefulDelete(genericapirequest.NewContext(), tc.in, out)
 		if out.GracePeriodSeconds == nil {
 			t.Errorf("out grace period was nil but supposed to be %v", tc.gracePeriod)
 		}
@@ -148,38 +314,63 @@ type mockPodGetter struct {
 	pod *api.Pod
 }
 
-func (g mockPodGetter) Get(api.Context, string) (runtime.Object, error) {
+func (g mockPodGetter) Get(context.Context, string, *metav1.GetOptions) (runtime.Object, error) {
 	return g.pod, nil
 }
 
 func TestCheckLogLocation(t *testing.T) {
-	ctx := api.NewDefaultContext()
+	ctx := genericapirequest.NewDefaultContext()
 	tcs := []struct {
-		in          *api.Pod
-		opts        *api.PodLogOptions
-		expectedErr error
+		name              string
+		in                *api.Pod
+		opts              *api.PodLogOptions
+		expectedErr       error
+		expectedTransport http.RoundTripper
 	}{
 		{
-			in: &api.Pod{
-				Spec:   api.PodSpec{},
-				Status: api.PodStatus{},
-			},
-			opts:        &api.PodLogOptions{},
-			expectedErr: errors.NewBadRequest("a container name must be specified for pod test"),
-		},
-		{
+			name: "simple",
 			in: &api.Pod{
 				Spec: api.PodSpec{
 					Containers: []api.Container{
 						{Name: "mycontainer"},
 					},
+					NodeName: "foo",
 				},
 				Status: api.PodStatus{},
 			},
-			opts:        &api.PodLogOptions{},
-			expectedErr: nil,
+			opts:              &api.PodLogOptions{},
+			expectedErr:       nil,
+			expectedTransport: fakeSecureRoundTripper,
 		},
 		{
+			name: "insecure",
+			in: &api.Pod{
+				Spec: api.PodSpec{
+					Containers: []api.Container{
+						{Name: "mycontainer"},
+					},
+					NodeName: "foo",
+				},
+				Status: api.PodStatus{},
+			},
+			opts: &api.PodLogOptions{
+				InsecureSkipTLSVerifyBackend: true,
+			},
+			expectedErr:       nil,
+			expectedTransport: fakeInsecureRoundTripper,
+		},
+		{
+			name: "missing container",
+			in: &api.Pod{
+				Spec:   api.PodSpec{},
+				Status: api.PodStatus{},
+			},
+			opts:              &api.PodLogOptions{},
+			expectedErr:       errors.NewBadRequest("a container name must be specified for pod test"),
+			expectedTransport: nil,
+		},
+		{
+			name: "choice of two containers",
 			in: &api.Pod{
 				Spec: api.PodSpec{
 					Containers: []api.Container{
@@ -189,10 +380,12 @@ func TestCheckLogLocation(t *testing.T) {
 				},
 				Status: api.PodStatus{},
 			},
-			opts:        &api.PodLogOptions{},
-			expectedErr: errors.NewBadRequest("a container name must be specified for pod test, choose one of: [container1 container2]"),
+			opts:              &api.PodLogOptions{},
+			expectedErr:       errors.NewBadRequest("a container name must be specified for pod test, choose one of: [container1 container2]"),
+			expectedTransport: nil,
 		},
 		{
+			name: "initcontainers",
 			in: &api.Pod{
 				Spec: api.PodSpec{
 					Containers: []api.Container{
@@ -205,10 +398,12 @@ func TestCheckLogLocation(t *testing.T) {
 				},
 				Status: api.PodStatus{},
 			},
-			opts:        &api.PodLogOptions{},
-			expectedErr: errors.NewBadRequest("a container name must be specified for pod test, choose one of: [container1 container2] or one of the init containers: [initcontainer1]"),
+			opts:              &api.PodLogOptions{},
+			expectedErr:       errors.NewBadRequest("a container name must be specified for pod test, choose one of: [container1 container2] or one of the init containers: [initcontainer1]"),
+			expectedTransport: nil,
 		},
 		{
+			name: "bad container",
 			in: &api.Pod{
 				Spec: api.PodSpec{
 					Containers: []api.Container{
@@ -221,38 +416,208 @@ func TestCheckLogLocation(t *testing.T) {
 			opts: &api.PodLogOptions{
 				Container: "unknown",
 			},
-			expectedErr: errors.NewBadRequest("container unknown is not valid for pod test"),
+			expectedErr:       errors.NewBadRequest("container unknown is not valid for pod test"),
+			expectedTransport: nil,
 		},
 		{
+			name: "good with two containers",
 			in: &api.Pod{
 				Spec: api.PodSpec{
 					Containers: []api.Container{
 						{Name: "container1"},
 						{Name: "container2"},
 					},
+					NodeName: "foo",
 				},
 				Status: api.PodStatus{},
 			},
 			opts: &api.PodLogOptions{
 				Container: "container2",
 			},
-			expectedErr: nil,
+			expectedErr:       nil,
+			expectedTransport: fakeSecureRoundTripper,
 		},
 	}
 	for _, tc := range tcs {
-		getter := &mockPodGetter{tc.in}
-		_, _, err := LogLocation(getter, nil, ctx, "test", tc.opts)
-		if !reflect.DeepEqual(err, tc.expectedErr) {
-			t.Errorf("expected %v, got %v", tc.expectedErr, err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			getter := &mockPodGetter{tc.in}
+			connectionGetter := &mockConnectionInfoGetter{&client.ConnectionInfo{
+				Transport:                      fakeSecureRoundTripper,
+				InsecureSkipTLSVerifyTransport: fakeInsecureRoundTripper,
+			}}
+
+			_, actualTransport, err := LogLocation(getter, connectionGetter, ctx, "test", tc.opts)
+			if !reflect.DeepEqual(err, tc.expectedErr) {
+				t.Errorf("expected %v, got %v", tc.expectedErr, err)
+			}
+			if actualTransport != tc.expectedTransport {
+				t.Errorf("expected %v, got %v", tc.expectedTransport, actualTransport)
+			}
+		})
 	}
 }
 
 func TestSelectableFieldLabelConversions(t *testing.T) {
 	apitesting.TestSelectableFieldLabelConversionsOfKind(t,
-		testapi.Default.GroupVersion().String(),
+		"v1",
 		"Pod",
 		PodToSelectableFields(&api.Pod{}),
 		nil,
 	)
 }
+
+type mockConnectionInfoGetter struct {
+	info *client.ConnectionInfo
+}
+
+func (g mockConnectionInfoGetter) GetConnectionInfo(ctx context.Context, nodeName types.NodeName) (*client.ConnectionInfo, error) {
+	return g.info, nil
+}
+
+func TestPortForwardLocation(t *testing.T) {
+	ctx := genericapirequest.NewDefaultContext()
+	tcs := []struct {
+		in          *api.Pod
+		info        *client.ConnectionInfo
+		opts        *api.PodPortForwardOptions
+		expectedErr error
+		expectedURL *url.URL
+	}{
+		{
+			in: &api.Pod{
+				Spec: api.PodSpec{},
+			},
+			opts:        &api.PodPortForwardOptions{},
+			expectedErr: errors.NewBadRequest("pod test does not have a host assigned"),
+		},
+		{
+			in: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "ns",
+					Name:      "pod1",
+				},
+				Spec: api.PodSpec{
+					NodeName: "node1",
+				},
+			},
+			info:        &client.ConnectionInfo{},
+			opts:        &api.PodPortForwardOptions{},
+			expectedURL: &url.URL{Host: ":", Path: "/portForward/ns/pod1"},
+		},
+		{
+			in: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "ns",
+					Name:      "pod1",
+				},
+				Spec: api.PodSpec{
+					NodeName: "node1",
+				},
+			},
+			info:        &client.ConnectionInfo{},
+			opts:        &api.PodPortForwardOptions{Ports: []int32{80}},
+			expectedURL: &url.URL{Host: ":", Path: "/portForward/ns/pod1", RawQuery: "port=80"},
+		},
+	}
+	for _, tc := range tcs {
+		getter := &mockPodGetter{tc.in}
+		connectionGetter := &mockConnectionInfoGetter{tc.info}
+		loc, _, err := PortForwardLocation(getter, connectionGetter, ctx, "test", tc.opts)
+		if !reflect.DeepEqual(err, tc.expectedErr) {
+			t.Errorf("expected %v, got %v", tc.expectedErr, err)
+		}
+		if !reflect.DeepEqual(loc, tc.expectedURL) {
+			t.Errorf("expected %v, got %v", tc.expectedURL, loc)
+		}
+	}
+}
+
+func TestGetPodIP(t *testing.T) {
+	testCases := []struct {
+		name       string
+		pod        *api.Pod
+		expectedIP string
+	}{
+		{
+			name:       "nil pod",
+			pod:        nil,
+			expectedIP: "",
+		},
+		{
+			name: "no status object",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pod1"},
+				Spec:       api.PodSpec{},
+			},
+			expectedIP: "",
+		},
+		{
+			name: "no pod ips",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pod1"},
+				Spec:       api.PodSpec{},
+				Status:     api.PodStatus{},
+			},
+			expectedIP: "",
+		},
+		{
+			name: "empty list",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pod1"},
+				Spec:       api.PodSpec{},
+				Status: api.PodStatus{
+					PodIPs: []api.PodIP{},
+				},
+			},
+			expectedIP: "",
+		},
+		{
+			name: "1 ip",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pod1"},
+				Spec:       api.PodSpec{},
+				Status: api.PodStatus{
+					PodIPs: []api.PodIP{
+						{IP: "10.0.0.10"},
+					},
+				},
+			},
+			expectedIP: "10.0.0.10",
+		},
+		{
+			name: "multiple ips",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pod1"},
+				Spec:       api.PodSpec{},
+				Status: api.PodStatus{
+					PodIPs: []api.PodIP{
+						{IP: "10.0.0.10"},
+						{IP: "10.0.0.20"},
+					},
+				},
+			},
+			expectedIP: "10.0.0.10",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			podIP := getPodIP(tc.pod)
+			if podIP != tc.expectedIP {
+				t.Errorf("expected pod ip:%v does not match actual %v", tc.expectedIP, podIP)
+			}
+		})
+	}
+}
+
+type fakeTransport struct {
+	val string
+}
+
+func (f fakeTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+var (
+	fakeSecureRoundTripper   = fakeTransport{val: "secure"}
+	fakeInsecureRoundTripper = fakeTransport{val: "insecure"}
+)

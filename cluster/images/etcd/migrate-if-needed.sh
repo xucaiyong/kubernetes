@@ -14,95 +14,93 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This script performs data migration between etcd2 and etcd3 versions
-# if needed.
-# Expected usage of it is:
-#   ./migrate_if_needed <target-storage> <data-dir>
-# It will look into the contents of file <data-dir>/version.txt to
-# determine the current storage version (no file means etcd2).
+# NOTES
+# This script performs etcd upgrade based on the following environmental
+# variables:
+# TARGET_STORAGE - API of etcd to be used (supported: 'etcd3')
+# TARGET_VERSION - etcd release to be used (supported: '3.0.17', '3.1.12',
+# '3.2.24', "3.3.17", "3.4.3")
+# DATA_DIRECTORY - directory with etcd data
+#
+# The current etcd version and storage format is detected based on the
+# contents of "${DATA_DIRECTORY}/version.txt" file (if the file doesn't
+# exist, we default it to "3.0.17/etcd2".
+#
+# The update workflow support the following upgrade steps:
+# - 3.0.17/etcd3 -> 3.1.12/etcd3
+# - 3.1.12/etcd3 -> 3.2.24/etcd3
+# - 3.2.24/etcd3 -> 3.3.17/etcd3
+# - 3.3.17/etcd3 -> 3.4.3/etcd3
+#
+# NOTE: The releases supported in this script has to match release binaries
+# present in the etcd image (to make this script work correctly).
+#
+# Based on the current etcd version and storage format we detect what
+# upgrade step from this should be done to get reach target configuration
 
 set -o errexit
 set -o nounset
 
-if [ -z "${TARGET_STORAGE:-}" ]; then
-  echo "TARGET_USAGE variable unset - skipping migration"
-  exit 0
-fi
+# NOTE: BUNDLED_VERSION has to match release binaries present in the
+# etcd image (to make this script work correctly).
+BUNDLED_VERSIONS="3.0.17, 3.1.12, 3.2.24, 3.3.17, 3.4.3"
 
+ETCD_NAME="${ETCD_NAME:-etcd-$(hostname)}"
 if [ -z "${DATA_DIRECTORY:-}" ]; then
-  echo "DATA_DIRECTORY variable unset - skipping migration"
-  exit 0
+  echo "DATA_DIRECTORY variable unset - unexpected failure"
+  exit 1
 fi
 
-ETCD="${ETCD:-/usr/local/bin/etcd}"
-ETCDCTL="${ETCDCTL:-/usr/local/bin/etcdctl}"
-ATTACHLEASE="${ATTACHLEASE:-/usr/local/bin/attachlease}"
-VERSION_FILE="version.txt"
-CURRENT_STORAGE='etcd2'
-if [ -e "${DATA_DIRECTORY}/${VERSION_FILE}" ]; then
-  CURRENT_STORAGE="$(cat ${DATA_DIRECTORY}/${VERSION_FILE})"
+case "${DATA_DIRECTORY}" in
+  *event*)
+    ETCD_PEER_PORT=2381
+    ETCD_CLIENT_PORT=18631
+    ;;
+  *)
+    ETCD_PEER_PORT=2380
+    ETCD_CLIENT_PORT=18629
+    ;;
+esac
+
+if [ -z "${INITIAL_CLUSTER:-}" ]; then
+  echo "Warn: INITIAL_CLUSTER variable unset - defaulting to ${ETCD_NAME}=http://localhost:${ETCD_PEER_PORT}"
+  INITIAL_CLUSTER="${ETCD_NAME}=http://localhost:${ETCD_PEER_PORT}"
+fi
+if [ -z "${LISTEN_PEER_URLS:-}" ]; then
+  echo "Warn: LISTEN_PEER_URLS variable unset - defaulting to http://localhost:${ETCD_PEER_PORT}"
+  LISTEN_PEER_URLS="http://localhost:${ETCD_PEER_PORT}"
+fi
+if [ -z "${INITIAL_ADVERTISE_PEER_URLS:-}" ]; then
+  echo "Warn: INITIAL_ADVERTISE_PEER_URLS variable unset - defaulting to http://localhost:${ETCD_PEER_PORT}"
+  INITIAL_ADVERTISE_PEER_URLS="http://localhost:${ETCD_PEER_PORT}"
+fi
+if [ -z "${TARGET_VERSION:-}" ]; then
+  echo "TARGET_VERSION variable unset - unexpected failure"
+  exit 1
+fi
+if [ -z "${TARGET_STORAGE:-}" ]; then
+  echo "TARGET_STORAGE variable unset - unexpected failure"
+  exit 1
+fi
+ETCD_DATA_PREFIX="${ETCD_DATA_PREFIX:-/registry}"
+ETCD_CREDS="${ETCD_CREDS:-}"
+
+# Correctly support upgrade and rollback to non-default version.
+if [ "${DO_NOT_MOVE_BINARIES:-}" != "true" ]; then
+  cp "/usr/local/bin/etcd-${TARGET_VERSION}" "/usr/local/bin/etcd"
+  cp "/usr/local/bin/etcdctl-${TARGET_VERSION}" "/usr/local/bin/etcdctl"
 fi
 
-start_etcd() {
-  ETCD_PORT=18629
-  ETCD_PEER_PORT=18630
-  ${ETCD} --data-dir=${DATA_DIRECTORY} \
-    --listen-client-urls http://127.0.0.1:${ETCD_PORT} \
-    --advertise-client-urls http://127.0.0.1:${ETCD_PORT} \
-    --listen-peer-urls http://127.0.0.1:${ETCD_PEER_PORT} \
-    --initial-advertise-peer-urls http://127.0.0.1:${ETCD_PEER_PORT} \
-    1>>/dev/null 2>&1 &
-  ETCD_PID=$!
-  # Wait until etcd is up.
-  for i in $(seq 30); do
-    local out
-    if out=$(wget -q --timeout=1 http://127.0.0.1:${ETCD_PORT}/v2/machines 2> /dev/null); then
-      echo "Etcd on port ${ETCD_PORT} is up."
-      return 0
-    fi
-    sleep 0.5
-  done
-  echo "Timeout while waiting for etcd on port ${ETCD_PORT}"
-  return 1
-}
-
-stop_etcd() {
-  kill "${ETCD_PID-}" >/dev/null 2>&1 || :
-  wait "${ETCD_PID-}" >/dev/null 2>&1 || :
-}
-
-if [ "${CURRENT_STORAGE}" = "etcd2" -a "${TARGET_STORAGE}" = "etcd3" ]; then
-  # If directory doesn't exist or is empty, this means that there aren't any
-  # data for migration, which means we can skip this step.
-  if [ -d "${DATA_DIRECTORY}" ]; then
-    if [ "$(ls -A ${DATA_DIRECTORY})" ]; then
-      echo "Performing etcd2 -> etcd3 migration"
-      ETCDCTL_API=3 ${ETCDCTL} migrate --data-dir=${DATA_DIRECTORY}
-      echo "Attaching leases to TTL entries"
-      # Now attach lease to all keys.
-      # To do it, we temporarily start etcd on a random port (so that
-      # apiserver actually cannot access it).
-      start_etcd
-      # Create a lease and attach all keys to it.
-      ${ATTACHLEASE} \
-        --etcd-address http://127.0.0.1:${ETCD_PORT} \
-        --ttl-keys-prefix "${TTL_KEYS_DIRECTORY:-/registry/events}" \
-        --lease-duration 1h
-      # Kill etcd and wait until this is down.
-      stop_etcd
-    fi
-  fi
-fi
-
-if [ "${CURRENT_STORAGE}" = "etcd3" -a "${TARGET_STORAGE}" = "etcd2" ]; then
-  echo "Performing etcd3 -> etcd2 migration"
-  # TODO: Implement rollback once this will be supported.
-  echo "etcd3 -> etcd2 downgrade is NOT supported."
-  # FIXME: On rollback, we will not support TTLs - we will simply clear
-  # all events.
-fi
-
-# Write current storage version to avoid future migrations.
-# If directory doesn't exist, we need to create it first.
-mkdir -p "${DATA_DIRECTORY}"
-echo "${TARGET_STORAGE}" > "${DATA_DIRECTORY}/${VERSION_FILE}"
+/usr/local/bin/migrate \
+  --name "${ETCD_NAME}" \
+  --port "${ETCD_CLIENT_PORT}" \
+  --listen-peer-urls "${LISTEN_PEER_URLS}" \
+  --initial-advertise-peer-urls "${INITIAL_ADVERTISE_PEER_URLS}" \
+  --data-dir "${DATA_DIRECTORY}" \
+  --bundled-versions "${BUNDLED_VERSIONS}" \
+  --initial-cluster "${INITIAL_CLUSTER}" \
+  --target-version "${TARGET_VERSION}" \
+  --target-storage "${TARGET_STORAGE}" \
+  --etcd-data-prefix "${ETCD_DATA_PREFIX}" \
+  --ttl-keys-directory "${TTL_KEYS_DIRECTORY:-${ETCD_DATA_PREFIX}/events}" \
+  --etcd-server-extra-args "${ETCD_CREDS}"

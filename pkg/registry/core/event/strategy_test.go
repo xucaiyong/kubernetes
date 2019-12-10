@@ -20,29 +20,19 @@ import (
 	"reflect"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/testapi"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/util/diff"
 	apitesting "k8s.io/kubernetes/pkg/api/testing"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/util/diff"
-)
+	api "k8s.io/kubernetes/pkg/apis/core"
 
-func testEvent(name string) *api.Event {
-	return &api.Event{
-		ObjectMeta: api.ObjectMeta{
-			Name:      name,
-			Namespace: "default",
-		},
-		InvolvedObject: api.ObjectReference{
-			Namespace: "default",
-		},
-		Reason: "forTesting",
-	}
-}
+	// install all api groups for testing
+	_ "k8s.io/kubernetes/pkg/api/testapi"
+)
 
 func TestGetAttrs(t *testing.T) {
 	eventA := &api.Event{
-		ObjectMeta: api.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "f0118",
 			Namespace: "default",
 		},
@@ -51,7 +41,7 @@ func TestGetAttrs(t *testing.T) {
 			Name:            "foo",
 			Namespace:       "baz",
 			UID:             "long uid string",
-			APIVersion:      testapi.Default.GroupVersion().String(),
+			APIVersion:      "v1",
 			ResourceVersion: "0",
 			FieldPath:       "",
 		},
@@ -59,7 +49,7 @@ func TestGetAttrs(t *testing.T) {
 		Source: api.EventSource{Component: "test"},
 		Type:   api.EventTypeNormal,
 	}
-	field := EventToSelectableFields(eventA)
+	field := ToSelectableFields(eventA)
 	expect := fields.Set{
 		"metadata.name":                  "f0118",
 		"metadata.namespace":             "default",
@@ -67,7 +57,7 @@ func TestGetAttrs(t *testing.T) {
 		"involvedObject.name":            "foo",
 		"involvedObject.namespace":       "baz",
 		"involvedObject.uid":             "long uid string",
-		"involvedObject.apiVersion":      testapi.Default.GroupVersion().String(),
+		"involvedObject.apiVersion":      "v1",
 		"involvedObject.resourceVersion": "0",
 		"involvedObject.fieldPath":       "",
 		"reason":                         "ForTesting",
@@ -80,9 +70,9 @@ func TestGetAttrs(t *testing.T) {
 }
 
 func TestSelectableFieldLabelConversions(t *testing.T) {
-	fset := EventToSelectableFields(&api.Event{})
+	fset := ToSelectableFields(&api.Event{})
 	apitesting.TestSelectableFieldLabelConversionsOfKind(t,
-		testapi.Default.GroupVersion().String(),
+		"v1",
 		"Event",
 		fset,
 		nil,

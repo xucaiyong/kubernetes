@@ -22,14 +22,16 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/client/record"
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/clock"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/tools/record"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	containertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/kubelet/util/queue"
-	"k8s.io/kubernetes/pkg/types"
-	"k8s.io/kubernetes/pkg/util/clock"
 )
 
 // fakePodWorkers runs sync pod function in serial, so we can have
@@ -56,7 +58,7 @@ func (f *fakePodWorkers) UpdatePod(options *UpdatePodOptions) {
 	}
 }
 
-func (f *fakePodWorkers) ForgetNonExistingPodWorkers(desiredPods map[types.UID]empty) {}
+func (f *fakePodWorkers) ForgetNonExistingPodWorkers(desiredPods map[types.UID]sets.Empty) {}
 
 func (f *fakePodWorkers) ForgetWorker(uid types.UID) {}
 
@@ -64,9 +66,9 @@ type TestingInterface interface {
 	Errorf(format string, args ...interface{})
 }
 
-func newPod(uid, name string) *api.Pod {
-	return &api.Pod{
-		ObjectMeta: api.ObjectMeta{
+func newPod(uid, name string) *v1.Pod {
+	return &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
 			UID:  types.UID(uid),
 			Name: name,
 		},
@@ -127,7 +129,6 @@ func drainWorkers(podWorkers *podWorkers, numPods int) {
 func TestUpdatePod(t *testing.T) {
 	podWorkers, processed := createPodWorkers()
 
-	// Check whether all pod updates will be processed.
 	numPods := 20
 	for i := 0; i < numPods; i++ {
 		for j := i; j < numPods; j++ {
@@ -150,6 +151,7 @@ func TestUpdatePod(t *testing.T) {
 			continue
 		}
 
+		// PodWorker guarantees the first and the last event will be processed
 		first := 0
 		last := len(processed[uid]) - 1
 		if processed[uid][first].name != string(0) {
@@ -218,9 +220,9 @@ func TestForgetNonExistingPodWorkers(t *testing.T) {
 		t.Errorf("Incorrect number of open channels %v", len(podWorkers.podUpdates))
 	}
 
-	desiredPods := map[types.UID]empty{}
-	desiredPods[types.UID(2)] = empty{}
-	desiredPods[types.UID(14)] = empty{}
+	desiredPods := map[types.UID]sets.Empty{}
+	desiredPods[types.UID(2)] = sets.Empty{}
+	desiredPods[types.UID(14)] = sets.Empty{}
 	podWorkers.ForgetNonExistingPodWorkers(desiredPods)
 	if len(podWorkers.podUpdates) != 2 {
 		t.Errorf("Incorrect number of open channels %v", len(podWorkers.podUpdates))
@@ -232,15 +234,15 @@ func TestForgetNonExistingPodWorkers(t *testing.T) {
 		t.Errorf("No updates channel for pod 14")
 	}
 
-	podWorkers.ForgetNonExistingPodWorkers(map[types.UID]empty{})
+	podWorkers.ForgetNonExistingPodWorkers(map[types.UID]sets.Empty{})
 	if len(podWorkers.podUpdates) != 0 {
 		t.Errorf("Incorrect number of open channels %v", len(podWorkers.podUpdates))
 	}
 }
 
 type simpleFakeKubelet struct {
-	pod       *api.Pod
-	mirrorPod *api.Pod
+	pod       *v1.Pod
+	mirrorPod *v1.Pod
 	podStatus *kubecontainer.PodStatus
 	wg        sync.WaitGroup
 }
@@ -254,19 +256,6 @@ func (kl *simpleFakeKubelet) syncPodWithWaitGroup(options syncPodOptions) error 
 	kl.pod, kl.mirrorPod, kl.podStatus = options.pod, options.mirrorPod, options.podStatus
 	kl.wg.Done()
 	return nil
-}
-
-// byContainerName sort the containers in a running pod by their names.
-type byContainerName kubecontainer.Pod
-
-func (b byContainerName) Len() int { return len(b.Containers) }
-
-func (b byContainerName) Swap(i, j int) {
-	b.Containers[i], b.Containers[j] = b.Containers[j], b.Containers[i]
-}
-
-func (b byContainerName) Less(i, j int) bool {
-	return b.Containers[i].Name < b.Containers[j].Name
 }
 
 // TestFakePodWorkers verifies that the fakePodWorkers behaves the same way as the real podWorkers
@@ -283,20 +272,20 @@ func TestFakePodWorkers(t *testing.T) {
 	fakePodWorkers := &fakePodWorkers{kubeletForFakeWorkers.syncPod, fakeCache, t}
 
 	tests := []struct {
-		pod       *api.Pod
-		mirrorPod *api.Pod
+		pod       *v1.Pod
+		mirrorPod *v1.Pod
 	}{
 		{
-			&api.Pod{},
-			&api.Pod{},
+			&v1.Pod{},
+			&v1.Pod{},
 		},
 		{
-			podWithUidNameNs("12345678", "foo", "new"),
-			podWithUidNameNs("12345678", "fooMirror", "new"),
+			podWithUIDNameNs("12345678", "foo", "new"),
+			podWithUIDNameNs("12345678", "fooMirror", "new"),
 		},
 		{
-			podWithUidNameNs("98765", "bar", "new"),
-			podWithUidNameNs("98765", "barMirror", "new"),
+			podWithUIDNameNs("98765", "bar", "new"),
+			podWithUIDNameNs("98765", "barMirror", "new"),
 		},
 	}
 
@@ -336,7 +325,7 @@ func TestKillPodNowFunc(t *testing.T) {
 	killPodFunc := killPodNow(podWorkers, fakeRecorder)
 	pod := newPod("test", "test")
 	gracePeriodOverride := int64(0)
-	err := killPodFunc(pod, api.PodStatus{Phase: api.PodFailed, Reason: "reason", Message: "message"}, &gracePeriodOverride)
+	err := killPodFunc(pod, v1.PodStatus{Phase: v1.PodFailed, Reason: "reason", Message: "message"}, &gracePeriodOverride)
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}

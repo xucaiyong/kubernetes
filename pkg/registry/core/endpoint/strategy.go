@@ -17,27 +17,26 @@ limitations under the License.
 package endpoint
 
 import (
-	"fmt"
+	"context"
 
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/storage/names"
 	endptspkg "k8s.io/kubernetes/pkg/api/endpoints"
-	"k8s.io/kubernetes/pkg/api/validation"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
-	"k8s.io/kubernetes/pkg/registry/generic"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util/validation/field"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/apis/core/validation"
 )
 
 // endpointsStrategy implements behavior for Endpoints
 type endpointsStrategy struct {
 	runtime.ObjectTyper
-	api.NameGenerator
+	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating Endpoint
 // objects via the REST API.
-var Strategy = endpointsStrategy{api.Scheme, api.SimpleNameGenerator}
+var Strategy = endpointsStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
 
 // NamespaceScoped is true for endpoints.
 func (endpointsStrategy) NamespaceScoped() bool {
@@ -45,16 +44,18 @@ func (endpointsStrategy) NamespaceScoped() bool {
 }
 
 // PrepareForCreate clears fields that are not allowed to be set by end users on creation.
-func (endpointsStrategy) PrepareForCreate(ctx api.Context, obj runtime.Object) {
+func (endpointsStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
-func (endpointsStrategy) PrepareForUpdate(ctx api.Context, obj, old runtime.Object) {
+func (endpointsStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 }
 
 // Validate validates a new endpoints.
-func (endpointsStrategy) Validate(ctx api.Context, obj runtime.Object) field.ErrorList {
-	return validation.ValidateEndpoints(obj.(*api.Endpoints))
+func (endpointsStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
+	allErrs := validation.ValidateEndpoints(obj.(*api.Endpoints))
+	allErrs = append(allErrs, validation.ValidateConditionalEndpoints(obj.(*api.Endpoints), nil)...)
+	return allErrs
 }
 
 // Canonicalize normalizes the object after validation.
@@ -69,26 +70,13 @@ func (endpointsStrategy) AllowCreateOnUpdate() bool {
 }
 
 // ValidateUpdate is the default update validation for an end user.
-func (endpointsStrategy) ValidateUpdate(ctx api.Context, obj, old runtime.Object) field.ErrorList {
+func (endpointsStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	errorList := validation.ValidateEndpoints(obj.(*api.Endpoints))
-	return append(errorList, validation.ValidateEndpointsUpdate(obj.(*api.Endpoints), old.(*api.Endpoints))...)
+	errorList = append(errorList, validation.ValidateEndpointsUpdate(obj.(*api.Endpoints), old.(*api.Endpoints))...)
+	errorList = append(errorList, validation.ValidateConditionalEndpoints(obj.(*api.Endpoints), old.(*api.Endpoints))...)
+	return errorList
 }
 
 func (endpointsStrategy) AllowUnconditionalUpdate() bool {
 	return true
-}
-
-// MatchEndpoints returns a generic matcher for a given label and field selector.
-func MatchEndpoints(label labels.Selector, field fields.Selector) *generic.SelectionPredicate {
-	return &generic.SelectionPredicate{Label: label, Field: field, GetAttrs: EndpointsAttributes}
-}
-
-// EndpointsAttributes returns the attributes of an endpoint such that a
-// generic.SelectionPredicate can match appropriately.
-func EndpointsAttributes(obj runtime.Object) (objLabels labels.Set, objFields fields.Set, err error) {
-	endpoints, ok := obj.(*api.Endpoints)
-	if !ok {
-		return nil, nil, fmt.Errorf("invalid object type %#v", obj)
-	}
-	return endpoints.Labels, generic.ObjectMetaFieldsSet(&endpoints.ObjectMeta, true), nil
 }

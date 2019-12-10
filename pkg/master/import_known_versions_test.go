@@ -17,11 +17,15 @@ limitations under the License.
 package master
 
 import (
-	"strings"
+	"reflect"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/apimachinery/registered"
-	"k8s.io/kubernetes/pkg/util/sets"
+	"k8s.io/api/core/v1"
+	apinamingtest "k8s.io/apimachinery/pkg/api/apitesting/naming"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
 )
 
 func TestGroupVersions(t *testing.T) {
@@ -32,20 +36,50 @@ func TestGroupVersions(t *testing.T) {
 		"apps",
 		"autoscaling",
 		"batch",
-		"componentconfig",
 		"extensions",
-		"federation",
 		"policy",
 	)
 
 	// No new groups should be added to the legacyUnsuffixedGroups exclusion list
-	if len(legacyUnsuffixedGroups) != 8 {
+	if len(legacyUnsuffixedGroups) != 6 {
 		t.Errorf("No additional unnamespaced groups should be created")
 	}
 
-	for _, gv := range registered.RegisteredGroupVersions() {
-		if !strings.HasSuffix(gv.Group, ".k8s.io") && !legacyUnsuffixedGroups.Has(gv.Group) {
-			t.Errorf("Group %s does not have the standard kubernetes API group suffix of .k8s.io", gv.Group)
-		}
+	if err := apinamingtest.VerifyGroupNames(legacyscheme.Scheme, legacyUnsuffixedGroups); err != nil {
+		t.Errorf("%v", err)
+	}
+}
+
+// These types are registered in external versions, and therefore include json tags,
+// but are also registered in internal versions (or referenced from internal types),
+// so we explicitly allow tags for them
+var typesAllowedTags = map[reflect.Type]bool{
+	reflect.TypeOf(intstr.IntOrString{}):          true,
+	reflect.TypeOf(metav1.Time{}):                 true,
+	reflect.TypeOf(metav1.MicroTime{}):            true,
+	reflect.TypeOf(metav1.Duration{}):             true,
+	reflect.TypeOf(metav1.TypeMeta{}):             true,
+	reflect.TypeOf(metav1.ListMeta{}):             true,
+	reflect.TypeOf(metav1.ObjectMeta{}):           true,
+	reflect.TypeOf(metav1.OwnerReference{}):       true,
+	reflect.TypeOf(metav1.LabelSelector{}):        true,
+	reflect.TypeOf(metav1.GetOptions{}):           true,
+	reflect.TypeOf(metav1.ExportOptions{}):        true,
+	reflect.TypeOf(metav1.ListOptions{}):          true,
+	reflect.TypeOf(metav1.DeleteOptions{}):        true,
+	reflect.TypeOf(metav1.GroupVersionKind{}):     true,
+	reflect.TypeOf(metav1.GroupVersionResource{}): true,
+	reflect.TypeOf(metav1.Status{}):               true,
+}
+
+// These fields are limited exceptions to the standard JSON naming structure.
+// Additions should only be made if a non-standard field name was released and cannot be changed for compatibility reasons.
+var allowedNonstandardJSONNames = map[reflect.Type]string{
+	reflect.TypeOf(v1.DaemonEndpoint{}): "Port",
+}
+
+func TestTypeTags(t *testing.T) {
+	if err := apinamingtest.VerifyTagNaming(legacyscheme.Scheme, typesAllowedTags, allowedNonstandardJSONNames); err != nil {
+		t.Errorf("%v", err)
 	}
 }
